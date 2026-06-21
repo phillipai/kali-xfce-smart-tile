@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+direction="${1:-}"
+case "$direction" in
+  up|down|left|right|monitor-up|monitor-down|monitor-left|monitor-right) ;;
+  *) exit 2 ;;
+esac
+
+for dependency in awk wmctrl xdotool xprop xrandr; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    notify-send "Smart tiling unavailable" "Missing dependency: $dependency" 2>/dev/null || true
+    exit 127
+  fi
+done
+
+state_file="${XDG_CACHE_HOME:-$HOME/.cache}/xfce-smart-tile-state"
+
+active_window() {
+  xprop -root _NET_ACTIVE_WINDOW | awk -F'window id # ' '{print $2}' | awk -F',' '{print $1}' | xargs
+}
+
+window_hidden() {
+  local state
+  state="$(xprop -id "$1" _NET_WM_STATE 2>/dev/null || true)"
+  [[ "$state" == *'_NET_WM_STATE_HIDDEN'* ]]
+}
+
+clear_state() {
+  rm -f "$state_file"
+}
+
+restore_remembered_window() {
+  [[ -f "$state_file" ]] || return 1
+  local state_type=""
+  local remembered_window=""
+  local remembered_pid=""
+  local fallback_focus=""
+  while IFS='=' read -r key value; do
+    case "$key" in
+      type) state_type="$value" ;;
+      window) remembered_window="$value" ;;
+      pid) remembered_pid="$value" ;;
+      fallback_focus) fallback_focus="$value" ;;
+    esac
+  done < "$state_file"
+
+  [[ "$state_type" == "minimized" ]] || return 1
+  [[ -n "$remembered_window" ]] || return 1
+  if [[ -n "$remembered_pid" ]]; then
+    current_pid="$(xdotool getwindowpid "$remembered_window" 2>/dev/null || true)"
+    if [[ -z "$current_pid" || "$current_pid" != "$remembered_pid" ]]; then
+      clear_state
+      return 1
+    fi
+  fi
+  if ! window_hidden "$remembered_window"; then
+    clear_state
+    return 1
+  fi
+
+  wmctrl -ia "$remembered_window"
+  sleep 0.1
+  xdotool windowactivate --sync "$remembered_window" || true
+  wmctrl -ir "$remembered_window" -b remove,hidden,fullscreen || true
+  wmctrl -ir "$remembered_window" -b add,maximized_vert,maximized_horz || true
+  clear_state
+  return 0
+}
+
+remember_minimized_window() {
+  local minimized_window="$1"
+  local fallback_focus
+  local minimized_pid
+  sleep 0.15
+  fallback_focus="$(active_window)"
+  minimized_pid="$(xdotool getwindowpid "$minimized_window" 2>/dev/null || true)"
+  printf 'type=minimized\nwindow=%s\npid=%s\nfallback_focus=%s\n' "$minimized_window" "$minimized_pid" "$fallback_focus" > "$state_file"
+}
+
+remember_controlled_window() {
+  local controlled_window="$1"
+  local controlled_pid fallback_focus
+  sleep 0.12
+  fallback_focus="$(active_window)"
+  controlled_pid="$(xdotool getwindowpid "$controlled_window" 2>/dev/null || true)"
+  printf 'type=controlled\nwindow=%s\npid=%s\nfallback_focus=%s\n' "$controlled_window" "$controlled_pid" "$fallback_focus" > "$state_file"
+}
+
+controlled_window_override() {
+  [[ -f "$state_file" ]] || return 1
+  local state_type=""
+  local remembered_window=""
+  local remembered_pid=""
+  local fallback_focus=""
+  local current_focus="$(active_window)"
+  local current_pid=""
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      type) state_type="$value" ;;
+      window) remembered_window="$value" ;;
+      pid) remembered_pid="$value" ;;
+      fallback_focus) fallback_focus="$value" ;;
+    esac
+  done < "$state_file"
+
+  [[ "$state_type" == "controlled" && -n "$remembered_window" ]] || return 1
+  [[ "$current_focus" == "$fallback_focus" || "$current_focus" == "$remembered_window" ]] || return 1
+
+  if [[ -n "$remembered_pid" ]]; then
+    current_pid="$(xdotool getwindowpid "$remembered_window" 2>/dev/null || true)"
+    [[ "$current_pid" == "$remembered_pid" ]] || return 1
+  fi
+
+  printf '%s' "$remembered_window"
+}
+
+if [[ "$direction" == "up" ]] && restore_remembered_window; then
+  exit 0
+fi
+
+if [[ -f "$state_file" ]]; then
+  remembered_type="$(awk -F= '$1 == "type" {print $2; exit}' "$state_file")"
+  if [[ "$remembered_type" == "minimized" && "$direction" != "up" ]]; then
+    exit 0
+  fi
+fi
+
+active_window_hex="$(active_window)"
+if override_window="$(controlled_window_override)"; then
+  active_window_hex="$override_window"
+fi
+if [[ -z "$active_window_hex" || "$active_window_hex" == "0x0" ]]; then
+  exit 0
+fi
+
+eval "$(xdotool getwindowgeometry --shell "$active_window_hex")"
+
+desktop_number="$(wmctrl -d | awk '$2 == "*" {print $1; exit}')"
+workarea="$(xprop -root _NET_WORKAREA | awk -F'= ' '{print $2}')"
+IFS=',' read -ra workareas <<< "$workarea"
+workarea_offset=$((desktop_number * 4))
+desktop_x="$(printf '%s' "${workareas[$workarea_offset]}" | xargs)"
+desktop_y="$(printf '%s' "${workareas[$((workarea_offset + 1))]}" | xargs)"
+desktop_w="$(printf '%s' "${workareas[$((workarea_offset + 2))]}" | xargs)"
+desktop_h="$(printf '%s' "${workareas[$((workarea_offset + 3))]}" | xargs)"
+
+best_overlap=-1
+mon_x="$desktop_x"
+mon_y="$desktop_y"
+mon_w="$desktop_w"
+mon_h="$desktop_h"
+monitor_count=0
+declare -a monitor_x monitor_y monitor_w monitor_h
+
+while read -r monitor_line; do
+  if [[ "$monitor_line" =~ [[:space:]]([0-9]+)\/[0-9]+x([0-9]+)\/[0-9]+\+(-?[0-9]+)\+(-?[0-9]+) ]]; then
+    candidate_w="${BASH_REMATCH[1]}"
+    candidate_h="${BASH_REMATCH[2]}"
+    candidate_x="${BASH_REMATCH[3]}"
+    candidate_y="${BASH_REMATCH[4]}"
+
+    monitor_x[$monitor_count]="$candidate_x"
+    monitor_y[$monitor_count]="$candidate_y"
+    monitor_w[$monitor_count]="$candidate_w"
+    monitor_h[$monitor_count]="$candidate_h"
+    monitor_count=$((monitor_count + 1))
+
+    overlap_left=$((X > candidate_x ? X : candidate_x))
+    overlap_top=$((Y > candidate_y ? Y : candidate_y))
+    overlap_right=$((X + WIDTH < candidate_x + candidate_w ? X + WIDTH : candidate_x + candidate_w))
+    overlap_bottom=$((Y + HEIGHT < candidate_y + candidate_h ? Y + HEIGHT : candidate_y + candidate_h))
+
+    if (( overlap_right > overlap_left && overlap_bottom > overlap_top )); then
+      overlap=$(((overlap_right - overlap_left) * (overlap_bottom - overlap_top)))
+    else
+      overlap=0
+    fi
+
+    if (( overlap > best_overlap )); then
+      best_overlap="$overlap"
+      mon_x="$candidate_x"
+      mon_y="$candidate_y"
+      mon_w="$candidate_w"
+      mon_h="$candidate_h"
+    fi
+  fi
+done < <(xrandr --listmonitors)
+
+compute_workarea() {
+  local base_x="$1"
+  local base_y="$2"
+  local base_w="$3"
+  local base_h="$4"
+  wa_x="$base_x"
+  wa_y="$base_y"
+  wa_right=$((base_x + base_w))
+  wa_bottom=$((base_y + base_h))
+
+  while read -r _ _ panel_x panel_y panel_w panel_h _ panel_title; do
+    [[ "$panel_title" == xfce4-panel* ]] || continue
+
+    panel_right=$((panel_x + panel_w))
+    panel_bottom=$((panel_y + panel_h))
+    overlap_left=$((panel_x > base_x ? panel_x : base_x))
+    overlap_top=$((panel_y > base_y ? panel_y : base_y))
+    overlap_right=$((panel_right < base_x + base_w ? panel_right : base_x + base_w))
+    overlap_bottom=$((panel_bottom < base_y + base_h ? panel_bottom : base_y + base_h))
+    (( overlap_right > overlap_left && overlap_bottom > overlap_top )) || continue
+
+    if (( panel_w >= base_w / 2 && panel_h <= base_h / 4 )); then
+      if (( panel_y <= base_y + base_h / 2 )); then
+        wa_y=$((panel_bottom > wa_y ? panel_bottom : wa_y))
+      else
+        wa_bottom=$((panel_y < wa_bottom ? panel_y : wa_bottom))
+      fi
+    elif (( panel_h >= base_h / 2 && panel_w <= base_w / 4 )); then
+      if (( panel_x <= base_x + base_w / 2 )); then
+        wa_x=$((panel_right > wa_x ? panel_right : wa_x))
+      else
+        wa_right=$((panel_x < wa_right ? panel_x : wa_right))
+      fi
+    fi
+  done < <(wmctrl -lG)
+
+  wa_w=$((wa_right - wa_x))
+  wa_h=$((wa_bottom - wa_y))
+  if (( wa_w <= 0 || wa_h <= 0 )); then
+    wa_x="$base_x"
+    wa_y="$base_y"
+    wa_w="$base_w"
+    wa_h="$base_h"
+    wa_right=$((wa_x + wa_w))
+    wa_bottom=$((wa_y + wa_h))
+  fi
+}
+
+compute_workarea "$mon_x" "$mon_y" "$mon_w" "$mon_h"
+
+frame_extents="$(xprop -id "$active_window_hex" _NET_FRAME_EXTENTS 2>/dev/null | awk -F'= ' '{print $2}' || true)"
+frame_left=0
+frame_right=0
+frame_top=0
+frame_bottom=0
+if [[ "$frame_extents" =~ ^[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+) ]]; then
+  frame_left="${BASH_REMATCH[1]}"
+  frame_right="${BASH_REMATCH[2]}"
+  frame_top="${BASH_REMATCH[3]}"
+  frame_bottom="${BASH_REMATCH[4]}"
+fi
+
+# Use frame-visible geometry for manual tiles. Raw monitor edges can place the
+# client at y=0, which hides the titlebar on X11 window managers like XFWM.
+safe_x=$((wa_x + frame_left + frame_right))
+safe_y=$((wa_y + frame_top * 2))
+safe_w=$((wa_w - frame_left - frame_right))
+safe_h=$((wa_h - frame_top - frame_bottom))
+if (( safe_w > 0 && safe_h > 0 )); then
+  wa_x="$safe_x"
+  wa_y="$safe_y"
+  wa_w="$safe_w"
+  wa_h="$safe_h"
+  wa_right=$((wa_x + wa_w))
+  wa_bottom=$((wa_y + wa_h))
+fi
+
+half_w=$((wa_w / 2))
+right_w=$((wa_w - half_w))
+half_h=$((wa_h / 2))
+bottom_h=$((wa_h - half_h))
+mid_x=$((wa_x + half_w))
+mid_y=$((wa_y + half_h))
+
+tolerance=120
+center_x=$((X + WIDTH / 2))
+center_y=$((Y + HEIGHT / 2))
+
+near() {
+  local actual="$1"
+  local expected="$2"
+  local delta=$((actual - expected))
+  [[ ${delta#-} -le "$tolerance" ]]
+}
+
+vertical_full() {
+  near "$Y" "$wa_y" && near "$HEIGHT" "$wa_h"
+}
+
+horizontal_full() {
+  near "$X" "$wa_x" && near "$WIDTH" "$wa_w"
+}
+
+full_area() {
+  horizontal_full && vertical_full
+}
+
+mostly_full_area() {
+  (( WIDTH >= wa_w - tolerance && HEIGHT >= wa_h - tolerance ))
+}
+
+top_half() {
+  (( center_y < mid_y )) && ! vertical_full
+}
+
+bottom_half() {
+  (( center_y >= mid_y )) && ! vertical_full
+}
+
+left_half() {
+  (( center_x < mid_x )) && ! horizontal_full
+}
+
+right_half() {
+  (( center_x >= mid_x )) && ! horizontal_full
+}
+
+left_full() {
+  (( center_x < mid_x )) && vertical_full
+}
+
+right_full() {
+  (( center_x >= mid_x )) && vertical_full
+}
+
+bottom_any() {
+  near "$Y" "$mid_y" || bottom_half
+}
+
+top_any() {
+  near "$Y" "$wa_y" && near "$HEIGHT" "$half_h"
+}
+
+move_window() {
+  local target_x="$1"
+  local target_y="$2"
+  local target_w="$3"
+  local target_h="$4"
+  local frame_extents frame_left=0 frame_right=0 frame_top=0 frame_bottom=0 move_x move_y
+
+  clear_state
+  wmctrl -ir "$active_window_hex" -b remove,maximized_vert,maximized_horz,fullscreen || true
+  xdotool windowactivate --sync "$active_window_hex"
+
+  frame_extents="$(xprop -id "$active_window_hex" _NET_FRAME_EXTENTS 2>/dev/null | awk -F'= ' '{print $2}' || true)"
+  if [[ "$frame_extents" =~ ^[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+),[[:space:]]*([0-9]+) ]]; then
+    frame_left="${BASH_REMATCH[1]}"
+    frame_right="${BASH_REMATCH[2]}"
+    frame_top="${BASH_REMATCH[3]}"
+    frame_bottom="${BASH_REMATCH[4]}"
+  fi
+
+  move_x=$((target_x - frame_left - frame_right))
+  move_y=$((target_y - frame_top * 2))
+
+  xdotool windowsize "$active_window_hex" "$target_w" "$target_h"
+  xdotool windowmove "$active_window_hex" "$move_x" "$move_y"
+  xdotool windowactivate --sync "$active_window_hex" || true
+  remember_controlled_window "$active_window_hex"
+}
+
+fill_window() {
+  local target_x="$1"
+  local target_y="$2"
+  local target_w="$3"
+  local target_h="$4"
+
+  clear_state
+  wmctrl -ir "$active_window_hex" -b remove,maximized_vert,maximized_horz,fullscreen || true
+  xdotool windowactivate --sync "$active_window_hex"
+
+  # Move a normal-sized frame onto the target monitor first; XFWM then maximizes
+  # using that monitor's native workarea, which handles aspect ratios and panels.
+  xdotool windowsize "$active_window_hex" "$((target_w / 2))" "$((target_h / 2))"
+  xdotool windowmove "$active_window_hex" "$((target_x + target_w / 4))" "$((target_y + target_h / 4))"
+  sleep 0.05
+  wmctrl -ir "$active_window_hex" -b add,maximized_vert,maximized_horz || true
+  xdotool windowactivate --sync "$active_window_hex" || true
+  remember_controlled_window "$active_window_hex"
+}
+
+abs() {
+  local value="$1"
+  printf '%s' "${value#-}"
+}
+
+move_to_adjacent_monitor() {
+  (( monitor_count > 1 )) || return 0
+
+  local travel_direction="${direction#monitor-}"
+  local current_left="$mon_x"
+  local current_top="$mon_y"
+  local current_right=$((mon_x + mon_w))
+  local current_bottom=$((mon_y + mon_h))
+  local current_cx=$((mon_x + mon_w / 2))
+  local current_cy=$((mon_y + mon_h / 2))
+  local best_index=-1
+  local best_score=0
+
+  for ((i = 0; i < monitor_count; i++)); do
+    local candidate_x="${monitor_x[$i]}"
+    local candidate_y="${monitor_y[$i]}"
+    local candidate_w="${monitor_w[$i]}"
+    local candidate_h="${monitor_h[$i]}"
+
+    if (( candidate_x == mon_x && candidate_y == mon_y && candidate_w == mon_w && candidate_h == mon_h )); then
+      continue
+    fi
+
+    local candidate_cx=$((candidate_x + candidate_w / 2))
+    local candidate_cy=$((candidate_y + candidate_h / 2))
+    local candidate_right=$((candidate_x + candidate_w))
+    local candidate_bottom=$((candidate_y + candidate_h))
+    local primary=0
+    local secondary=0
+    local overlap=0
+
+    case "$travel_direction" in
+      left)
+        (( candidate_right <= current_left || candidate_cx < current_cx )) || continue
+        primary=$((current_left - candidate_right))
+        (( primary < 0 )) && primary=0
+        overlap=$(((candidate_bottom < current_bottom ? candidate_bottom : current_bottom) - (candidate_y > current_top ? candidate_y : current_top)))
+        (( overlap < 0 )) && overlap=0
+        secondary="$(abs $((candidate_cy - current_cy)))"
+        ;;
+      right)
+        (( candidate_x >= current_right || candidate_cx > current_cx )) || continue
+        primary=$((candidate_x - current_right))
+        (( primary < 0 )) && primary=0
+        overlap=$(((candidate_bottom < current_bottom ? candidate_bottom : current_bottom) - (candidate_y > current_top ? candidate_y : current_top)))
+        (( overlap < 0 )) && overlap=0
+        secondary="$(abs $((candidate_cy - current_cy)))"
+        ;;
+      up)
+        (( candidate_bottom <= current_top || candidate_cy < current_cy )) || continue
+        primary=$((current_top - candidate_bottom))
+        (( primary < 0 )) && primary=0
+        overlap=$(((candidate_right < current_right ? candidate_right : current_right) - (candidate_x > current_left ? candidate_x : current_left)))
+        (( overlap < 0 )) && overlap=0
+        secondary="$(abs $((candidate_cx - current_cx)))"
+        ;;
+      down)
+        (( candidate_y >= current_bottom || candidate_cy > current_cy )) || continue
+        primary=$((candidate_y - current_bottom))
+        (( primary < 0 )) && primary=0
+        overlap=$(((candidate_right < current_right ? candidate_right : current_right) - (candidate_x > current_left ? candidate_x : current_left)))
+        (( overlap < 0 )) && overlap=0
+        secondary="$(abs $((candidate_cx - current_cx)))"
+        ;;
+    esac
+
+    local score=$((primary * 1000000 + secondary * 1000 - overlap))
+    if (( best_index < 0 || score < best_score )); then
+      best_index="$i"
+      best_score="$score"
+    fi
+  done
+
+  (( best_index >= 0 )) || return 0
+
+  compute_workarea "${monitor_x[$best_index]}" "${monitor_y[$best_index]}" "${monitor_w[$best_index]}" "${monitor_h[$best_index]}"
+  fill_window "$wa_x" "$wa_y" "$wa_w" "$wa_h"
+}
+
+if [[ "$direction" == monitor-* ]]; then
+  move_to_adjacent_monitor
+  exit 0
+fi
+
+case "$direction" in
+  up)
+    if top_any && horizontal_full; then
+      fill_window "$wa_x" "$wa_y" "$wa_w" "$wa_h"
+    elif (left_half || right_half) && (top_half || bottom_half); then
+      move_window "$wa_x" "$wa_y" "$wa_w" "$half_h"
+    elif mostly_full_area; then
+      move_window "$wa_x" "$wa_y" "$wa_w" "$half_h"
+    elif left_full; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$half_h"
+    elif right_full; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$half_h"
+    else
+      fill_window "$wa_x" "$wa_y" "$wa_w" "$wa_h"
+    fi
+    ;;
+  down)
+    if bottom_any && horizontal_full; then
+      xdotool windowminimize "$active_window_hex" || wmctrl -ir "$active_window_hex" -b add,hidden
+      remember_minimized_window "$active_window_hex"
+    elif (left_half || right_half) && (top_half || bottom_half); then
+      move_window "$wa_x" "$mid_y" "$wa_w" "$bottom_h"
+    elif horizontal_full; then
+      move_window "$wa_x" "$mid_y" "$wa_w" "$bottom_h"
+    elif (( center_x < mid_x )); then
+      move_window "$wa_x" "$mid_y" "$half_w" "$bottom_h"
+    elif (( center_x >= mid_x )); then
+      move_window "$mid_x" "$mid_y" "$right_w" "$bottom_h"
+    else
+      move_window "$wa_x" "$mid_y" "$wa_w" "$bottom_h"
+    fi
+    ;;
+  left)
+    if mostly_full_area; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$wa_h"
+    elif right_half && top_half; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$half_h"
+    elif right_half && bottom_half; then
+      move_window "$wa_x" "$mid_y" "$half_w" "$bottom_h"
+    elif right_full; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$wa_h"
+    elif left_half && top_half; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$wa_h"
+    elif left_half && bottom_half; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$wa_h"
+    elif left_full; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$half_h"
+    elif top_any; then
+      move_window "$wa_x" "$wa_y" "$half_w" "$half_h"
+    elif bottom_any; then
+      move_window "$wa_x" "$mid_y" "$half_w" "$bottom_h"
+    else
+      move_window "$wa_x" "$wa_y" "$half_w" "$wa_h"
+    fi
+    ;;
+  right)
+    if mostly_full_area; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$wa_h"
+    elif left_half && top_half; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$half_h"
+    elif left_half && bottom_half; then
+      move_window "$mid_x" "$mid_y" "$right_w" "$bottom_h"
+    elif left_full; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$wa_h"
+    elif right_half && top_half; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$wa_h"
+    elif right_half && bottom_half; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$wa_h"
+    elif right_full; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$half_h"
+    elif top_any; then
+      move_window "$mid_x" "$wa_y" "$right_w" "$half_h"
+    elif bottom_any; then
+      move_window "$mid_x" "$mid_y" "$right_w" "$bottom_h"
+    else
+      move_window "$mid_x" "$wa_y" "$right_w" "$wa_h"
+    fi
+    ;;
+esac
