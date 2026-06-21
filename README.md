@@ -1,5 +1,9 @@
 # Kali XFCE Smart Tile
 
+## Demonstration
+
+![Kali XFCE Smart Tile demonstration](assets/demo.gif)
+
 ## Abstract
 
 Kali XFCE Smart Tile is a lightweight X11 window-management helper that adds predictable keyboard-driven tiling to Kali Linux XFCE. It provides half-screen tiling, quarter-screen tiling, native monitor fill, multi-monitor transfer, and minimize/restore behavior using standard Linux X11 utilities.
